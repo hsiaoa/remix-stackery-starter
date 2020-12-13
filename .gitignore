@@ -1,0 +1,11 @@
+node_modules/
+
+remix/.cache
+remix/build
+remix/data-build
+remix/public/build
+
+.stackery
+.aws-sam
+lambda.zip
+lambda-build

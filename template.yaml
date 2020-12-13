@@ -1,0 +1,392 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  RemixServerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-RemixServerFunction
+      Description: !Sub
+        - Stack ${StackTagName} Environment ${EnvironmentTagName} Function ${ResourceName}
+        - ResourceName: RemixServerFunction
+      CodeUri: lambda
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 3008
+      Timeout: 30
+      Tracing: Active
+      Policies:
+        - AWSXrayWriteOnlyAccess
+      Events:
+        HttpApiEvent:
+          Type: HttpApi
+          Properties:
+            Method: x-amazon-apigateway-any-method
+            Path: /$default
+            ApiId: !Ref RemixServerApi
+            PayloadFormatVersion: '2.0'
+            TimeoutInMillis: 29000
+        WarmingSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Input: '{ "warmer":true,"concurrency":1 }'
+  RemixBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-remixpubl-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+  RemixBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RemixBucket
+      PolicyDocument:
+        Statement:
+          - Principal: '*'
+            Action: '*'
+            Effect: Deny
+            Resource: !Sub
+              - ${BucketArn}/*
+              - BucketArn: !GetAtt RemixBucket.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${RemixFrontendCdnOriginAccessIdentity}
+            Action: s3:GetObject
+            Resource: !Sub
+              - ${BucketArn}/*
+              - BucketArn: !GetAtt RemixBucket.Arn
+  RemixFrontendCdn:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases: !If
+          - WebDomainNamePresent
+          - - !Ref WebDomainName
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - WebDomainNamePresent
+          - AcmCertificateArn: !Sub arn:aws:acm:${AWS::Region}:${AWS::AccountId}:certificate/${CerfiticateId}
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2019
+          - !Ref AWS::NoValue
+        DefaultCacheBehavior:
+          CachePolicyId: RemixCachePolicy
+          OriginRequestPolicyId: RemixOriginRequestPolicy
+          Compress: true
+          TargetOriginId: remixgroup
+          ViewerProtocolPolicy: redirect-to-https
+          LambdaFunctionAssociations:
+            - EventType: origin-request
+              LambdaFunctionARN: !GetAtt HeadersForwardingFunction.VersionArn
+        DefaultRootObject: !Ref AWS::NoValue
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_All
+        OriginGroups:
+          Items:
+            - Id: remixgroup
+              FailoverCriteria:
+                StatusCodes:
+                  Items:
+                    - 403
+                    - 404
+                  Quantity: 2
+              Members:
+                Items:
+                  - OriginId: remixbucket
+                  - OriginId: remixserverapi
+                Quantity: 2
+          Quantity: 1
+        Origins:
+          - DomainName: !GetAtt RemixBucket.RegionalDomainName
+            Id: remixbucket
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub
+                - origin-access-identity/cloudfront/${OriginAccessIdentity}
+                - OriginAccessIdentity: !Ref RemixFrontendCdnOriginAccessIdentity
+          - DomainName: !Sub ${RemixServerApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+            Id: remixserverapi
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+  RemixOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - X-Forwarded-Host
+            - Host
+        CookieConfig:
+          CookieBehavior: all
+  RemixCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyPolicyConfig:
+        name: RemixCDNCachePolicy
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 1
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          QueryStringsConfig:
+            QueryStringBehavior: all
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers:
+              - X-Forwarded-Host
+              - Host
+          CookieConfig:
+            CookieBehavior: all
+  RemixWebsite:
+    Type: AWS::CodeBuild::Project
+    Metadata:
+      StackeryType: website
+    DependsOn: RemixWebsiteRole
+    Properties:
+      Name: !Sub ${AWS::StackName}-RemixWebsite
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables: []
+      ServiceRole: !GetAtt RemixWebsiteRole.Arn
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: !Sub
+          - |-
+            version: 0.2
+            phases:
+              install:
+                runtime-versions:
+                  nodejs: latest
+                commands:
+                  - |
+                    _SOURCE_LOCATION="${SourceLocation}"
+                    if [ s3 != "${!_SOURCE_LOCATION%%:*}" ]; then
+                      git clone "${SourceLocation}" repo
+                      cd repo
+                      git checkout "${SourceVersion}"
+                    else
+                      aws s3 cp "${SourceLocation}" repo.tgz
+                      tar --strip-components 1 -xvvzf repo.tgz
+                    fi
+              pre_build:
+                commands:
+                  - cd ${SourceDirectory}
+                  - make
+                  - cd -
+              build:
+                commands:
+                  - cd ${DistDirectory}
+                  - make
+                  - cd -
+              post_build:
+                commands:
+                  - if [ $CODEBUILD_BUILD_SUCCEEDING == 0 ]; then exit 1; fi
+                  - aws s3 sync '${PublishDirectory}' 's3://${DestinationBucketName}' --cache-control 'max-age=600, must-revalidate, public' --no-progress --delete
+                  - aws lambda update-function-code --function-name ${FunctionName} --zip-file fileb://${ZipFile}
+          - PublishDirectory: remix/public
+            DestinationBucketName: !Ref RemixBucket
+            FunctionName: !Ref RemixServerFunction
+            SourceDirectory: remix
+            DistDirectory: remix
+            ZipFile: lambda.zip
+      Tags:
+        - Key: Stackery Project Type
+          Value: Website Builder
+  RemixWebsiteEvents:
+    Type: AWS::Events::Rule
+    DependsOn: RemixServerFunction
+    Properties:
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - CodeBuild Build State Change
+        detail:
+          build-status:
+            - SUCCEEDED
+            - FAILED
+            - FAULT
+            - STOPPPED
+            - TIMED_OUT
+          project-name:
+            - !Ref RemixWebsite
+      Targets:
+        - Arn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+          Id: StackeryAgentCommander
+  RemixWebsiteEventsPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: RemixWebsiteEvents
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RemixWebsiteEvents.Arn
+  RemixWebsiteBuildTrigger:
+    Type: Custom::StackeryWebsiteBuildTrigger
+    DependsOn: RemixWebsiteEvents
+    Properties:
+      ServiceToken: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+      Type: website
+      ProjectName: !Ref RemixWebsite
+      SourceVersion: !Ref SourceVersion
+  RemixWebsiteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-RemixWebsite
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-RemixWebsite:log-stream:*
+        - PolicyName: DownloadSourceFromStackeryAssetsBucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: arn:aws:s3:::stackery-assetsbucket-*/*
+        - PolicyName: UploadToDestinationObjectStore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub ${RemixBucket.Arn}/*
+                  - !Sub ${RemixBucket.Arn}
+        - PolicyName: UploadToDestinationLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                Resource: !GetAtt RemixServerFunction.Arn
+  RemixFrontendCdnOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: Stackery
+  RemixDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt RemixFrontendCdn.DomainName
+        HostedZoneId: !Ref MyAliasHostedZoneId
+      HostedZoneId: !Ref MyHostedZoneId
+      Name: !Ref WebDomainName
+      Type: A
+    Condition: WebDomainNamePresent
+  RemixServerApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefinitionBody:
+        openapi: '3.0'
+        info:
+          title: !Sub ${AWS::StackName}-HttpApi
+          version: '1.0'
+        paths:
+          /$default:
+            x-amazon-apigateway-any-method:
+              isDefaultRoute: true
+      FailOnWarnings: true
+  HeadersForwardingFunction:
+    Type: Custom::StackeryEdgeFunction
+    Properties:
+      ServiceToken: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+      FunctionName: !Sub ${AWS::StackName}-HeadersForwardingFunction
+      Description: !Sub
+        - Stack ${StackTagName} Environment ${EnvironmentTagName} Function ${ResourceName}
+        - ResourceName: HeadersForwardingFunction
+      CodeUri: edge-functions/headers-forwarding
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 5
+      Tracing: Active
+      Role: !GetAtt HeadersForwardingFunctionRole.Arn
+  HeadersForwardingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-HeadersForwardingFunctionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+              - edgelambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+Parameters:
+  StackTagName:
+    Type: String
+    Description: Stack Name (injected by Stackery at deployment time)
+  EnvironmentTagName:
+    Type: String
+    Description: Environment Name (injected by Stackery at deployment time)
+  SourceLocation:
+    Type: String
+    Description: Location of source code for deployment (injected by Stackery at deployment time)
+  SourceVersion:
+    Type: String
+    Description: Source version for deployment (injected by Stackery at deployment time)
+  WebDomainName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /<EnvironmentName>/WEB_DOMAIN_NAME
+  MyAliasHostedZoneId:
+    Type: String
+    Description: Alias Hosted Zone Id
+  MyHostedZoneId:
+    Type: String
+    Description: Hosted Zone Id
+Conditions:
+  WebDomainNamePresent: !Not
+    - !Equals
+      - 'false'
+      - !Ref WebDomainName
