@@ -16,6 +16,7 @@ Once ready, deploy to AWS with
 `stackery deploy` 
 
 ## Deployment Resources
+![Deployed Resources](https://github.com/hsiaoa/remix-stackery-starter/blob/master/stackery.png?raw=true)
 - Api Gateway (v2)
 - Server Lambda
 - EventBridge rule to keep lambda warm every 5 minutes
