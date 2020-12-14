@@ -24,6 +24,7 @@ Once ready, deploy to AWS with
 - CodeBuild to package and upload to S3 & Server Lambda
 - Cloudfront CDN 
 - Lambda@Edge for host header forwarding
+- Route 53 custom domain (optional)
 
 ## Known Issues and present solutions
 
