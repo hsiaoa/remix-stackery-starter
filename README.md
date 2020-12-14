@@ -31,7 +31,7 @@ Once ready, deploy to AWS with
 - Server and Static Assets File Hash Mismatch
   - To avoid file hashes mismatch on Lambda and S3 (server and static assets), we deploy a scafold to server lambda before using CodeBuild to package the entire server and upload to it and s3 at the same step.
 
-- When zipping server files for lambda, encounter `ZIP does not support timestamps before 1980` from python zip library
+- When zipping server files for lambda, encounter `ZIP does not support timestamps before 1980` from python zip library, possibly due to Remix's dependency on `Uglify` lib. 
   - Add a postinstall script `find ./node_modules/* -mtime +10950 -exec touch {} \\` to fix this issue
 
 - SAM-CLI generates a permission for API Gateway to invoke lambda: `AWS:SourceArn": "arn:aws:execute-api:REGION:ACCOUNT:httpapi-id/*/*/$default` While it looks [correct](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-control-access-using-iam-policies-to-invoke-api.html#api-gateway-who-can-invoke-an-api-method-using-iam-policies), we ran into "API Gateway has no permission to invoke lambda" issue. 
